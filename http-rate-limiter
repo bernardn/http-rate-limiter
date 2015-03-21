@@ -1,0 +1,211 @@
+#!/bin/bash
+#
+# http-rate-limit -   
+#
+# chkconfig:   - 85 15
+# description: Low-level tool, relying on DPI and IP filtering, to temporarily ignore the most demanding HTTP clients.
+# author: Bernard Nauwelaerts
+# processname: http-rate-limiter
+# pidfile:     /var/run/http-rate-limiter.pid
+
+
+RETVAL=0
+prog="http-rate-limit"
+PID_FILE="/var/run/$prog.pid"
+
+test -d ~/.$prog || mkdir ~/.$prog || exit 1
+cd ~/.$prog
+PID_FILE="limiter.pid"
+
+# Declare variables
+SAMPLE_LENGTH=5
+ITERATIONS=12
+BLOCK_TRIGGER_RPS=${BLOCK_TRIGGER_RPS:-100}
+
+BLOCK_CHAIN='RATEFILTER';
+BLOCK_ACTION='DROP'
+
+DEBUG=${DEBUG:-0}
+
+# Internal Variables
+BLOCK_CHAIN=$BLOCK_CHAIN'80'
+ITER=1
+ERRDEV=null
+s='' # logger flag for stdout
+LOCAL_IPS=$(ip -o addr| grep 'inet ' | awk '!/^[0-9]*: ?lo|link\/ether/ {gsub("/", " "); print $4}'|tr '\n' '|')127.0.0.1
+
+# Functions
+function connstats { grep '^[0-9:\.]* IP' "$1" | cut -f3 -d" " | cut -d"." -f 1-4 |sort | uniq -c | sort -n ; }
+function http_rate_limit() {
+	
+	test $DEBUG -eq 0 || { s='-s'; ERRDEV='stderr'; }
+	
+	logger $s -t $prog "Starting filtering with $ITERATIONS cycles of ${SAMPLE_LENGTH}s DPI";
+	logger $s -t $prog "Blocking trigger $BLOCK_TRIGGER_RPS rps with action $BLOCK_ACTION for "$(($ITERATIONS * $SAMPLE_LENGTH))"s"
+	
+	echo creating chain
+	sudo  iptables -C $BLOCK_CHAIN &>/dev/$ERRDEV || { sudo iptables -N $BLOCK_CHAIN && sudo iptables -A $BLOCK_CHAIN -j RETURN ; };
+	echo referencing chain
+	sudo  iptables -C INPUT -p tcp --destination-port 80 -j $BLOCK_CHAIN &>/dev/$ERRDEV || sudo iptables -I INPUT 1 -p tcp --destination-port 80 -j $BLOCK_CHAIN &>/dev/$ERRDEV
+	
+	while test 1; do
+		for i in $(seq 1 $ITERATIONS); do
+			echo $i > .iter
+			ITER=$i
+			unblock $i
+			timeout ${SAMPLE_LENGTH}s tcpdump -A -n -s 1024 'tcp dst port 80 and (((ip[2:2] - ((ip[0]&0xf)<<2)) - ((tcp[12]&0xf0)>>2)) != 0)' -i any 2>/dev/$ERRDEV > dump$SAMPLE_LENGTH-$i
+			connstats dump$SAMPLE_LENGTH-$i | egrep -v $LOCAL_IPS | awk '{
+				if ( $1 >= '$(($BLOCK_TRIGGER_RPS * $SAMPLE_LENGTH))' ) {
+					printf "%s %s\n", $1, $2
+				}
+			}' > ips_$SAMPLE_LENGTH;
+			cat ips_$SAMPLE_LENGTH >> ips_$SAMPLE_LENGTH.log;
+			sort ips_$SAMPLE_LENGTH | while read -r ipc; do
+				nr=$(echo $ipc |awk '{print $1}')
+				ip=$(echo $ipc |awk '{print $2}')
+				grep $ip blk$SAMPLE_LENGTH-*>/dev/$ERRDEV || {
+					sudo iptables -C $BLOCK_CHAIN -p tcp -s $ip --destination-port 80 -j $BLOCK_ACTION || {
+						{
+							sudo iptables -I $BLOCK_CHAIN 1 -p tcp -s $ip --destination-port 80 -j $BLOCK_ACTION;
+						} && {
+							hostip=$(host $ip|grep 'domain name pointer'|awk '{print $5}')
+							cntry=$(geoiplookup "$ip"|tr '\n' ' '|sed 's/Edition//g')
+							rps=$(($nr/$SAMPLE_LENGTH))
+							logger $s -t $prog "IP $ip Blocked ($rps rps) - host ${hostip:-unknown} - country ${cntry:-unknown}"
+							grep $ip blk$SAMPLE_LENGTH-*>/dev/null || echo $ip >> blk$SAMPLE_LENGTH-$i;
+						}
+					}
+				}
+			done;
+		done;
+		sleep $(($SAMPLE_LENGTH - 1));
+	done
+}
+unblock() {
+	for ip in $(cat blk$SAMPLE_LENGTH-${1:-*} |sort|uniq); do
+		status='successfully'
+		sudo iptables -D $BLOCK_CHAIN -p tcp -s "$ip" --destination-port 80 -j $BLOCK_ACTION 2>/dev/$ERRDEV || status='un'$status;
+		logger $s -t $prog "IP $ip $status unblocked"
+	done
+	for f in blk$SAMPLE_LENGTH-${1:-*}; do
+		cat /dev/null> $f
+	done
+}
+dreset() {
+	unblock
+	sudo iptables -F $BLOCK_CHAIN &>/dev/$ERRDEV
+	sudo iptables -A $BLOCK_CHAIN -j RETURN
+}
+
+start() {
+		echo -n "Starting $prog... "
+		$(dstatus >/dev/null);
+		if test $? -eq 3; then
+			http_rate_limit &>/dev/null &
+			PID=$!
+			echo pid $PID
+			sleep 1;
+			if ps -p $PID > /dev/null 2>&1; then
+				echo $PID > $PID_FILE
+			else
+				echo "$prog did not start"
+				exit 1
+			fi
+			echo done.
+			exit 0
+		fi
+		echo failed.
+		return 1
+}
+
+stop() {
+	echo -n "Shutting down $prog... "
+	if [ -e "$PID_FILE" ]; then
+		kill `cat $PID_FILE` && rm $PID_FILE
+		dreset
+		sudo iptables -D INPUT -p tcp --destination-port 80 -j $BLOCK_CHAIN &>/dev/$ERRDEV 
+		sudo iptables -F $BLOCK_CHAIN &>/dev/$ERRDEV
+		sudo iptables -X $BLOCK_CHAIN &>/dev/$ERRDEV 
+		logger $s -t $prog "Stopped"
+		echo done.
+	else
+		echo "$prog is not running"
+		return 1
+	fi
+	return 0
+}
+
+ddebug() {
+	$(dstatus >/dev/null);
+	if test $? -eq 3; then
+		http_rate_limit
+	fi
+}
+
+dwarnstopped () {
+	$(dstatus >/dev/null);
+	if test $? -eq 3; then
+		echo warn: $prog is not running
+	fi
+}
+dstatus() {
+	PID=$(cat $PID_FILE 2>/dev/null)
+	test ! -z "$PID" && ps -p $PID &>/dev/null && echo "Started ($PID)" && exit 1
+	echo "Stopped".
+	exit 3
+}
+dps () {	
+	dwarnstopped
+	ITER=$(cat .iter)
+	i=$(($ITER-1))
+	test $i -eq 0 && i=$ITERATIONS
+	grep '^[0-9:\.]* IP' dump$SAMPLE_LENGTH-$i | cut -f3 -d" " | cut -d"." -f 1-4 |sort | uniq -c | sort -n$1 | awk '{ printf "rps\t%s\t%s\n", $1/'$SAMPLE_LENGTH', $2 }'
+}
+drate () {
+	dwarnstopped
+	echo $(dps|awk '{ print $2 }'|paste -sd+ 2>/dev/null | bc) rps
+}
+dblk () {
+	dwarnstopped
+	cat blk$SAMPLE_LENGTH-* 2>/dev/null| sort | uniq -c | sort -nr
+}
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    reset)
+        dreset
+        ;;
+    status)
+        dstatus
+        ;;
+    restart)
+        stop
+        sleep 1
+        start
+        ;;
+	blk)
+		dblk
+		;;
+	ps)
+		dps r
+		;;
+	psr)
+		dps
+		;;
+	rate)
+		drate
+		;;
+	debug)
+		DEBUG=1
+		ddebug
+		;;
+	*)
+		echo "Usage: $prog {start|stop|restart|reset|status|blk|ps|psr|rate|debug}"
+		exit 1
+		;;
+esac
+exit $RETVAL
